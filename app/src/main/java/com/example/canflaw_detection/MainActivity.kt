@@ -1,16 +1,18 @@
 package com.example.canflaw_detection
 
 import android.Manifest
-import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
+import android.graphics.Matrix
+import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.os.Bundle
 import android.util.Base64
 import android.util.Log
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -33,6 +35,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
@@ -52,17 +55,29 @@ import okhttp3.MediaType.Companion.toMediaTypeOrNull
 
 // Import necessary packages
 // 1. Complete Detection Data Class
+// Update Detection data class to include confidence
 data class Detection(
     val x: Float,
     val y: Float,
     val width: Float,
     val height: Float,
-    val label: String
+    val label: String,
+    val confidence: Float
 )
 
 class MainActivity : ComponentActivity() {
+    companion object {
+        // Detection interval in milliseconds (e.g., 1000ms = 1 second)
+        // Processing 2.5 frames per second
+        const val DETECTION_INTERVAL: Long = 1000
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState) // Fixed missing parenthesis
+        super.onCreate(savedInstanceState)
+        
+        // Add this line to keep screen on
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        
         enableEdgeToEdge()
         setContent {
             Canflaw_detectionTheme {
@@ -87,8 +102,6 @@ fun CameraScreen(modifier: Modifier = Modifier) {
     }
     var cameraStarted by remember { mutableStateOf(false) }
 
-    // 2. Lifted State
-    var detections by remember { mutableStateOf<List<Detection>>(emptyList()) }
 
     val launcher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
@@ -102,12 +115,7 @@ fun CameraScreen(modifier: Modifier = Modifier) {
 
     Box(modifier = modifier.fillMaxSize()) {
         if (hasCameraPermission && cameraStarted) {
-            CameraPreview(
-                detections = detections,
-                onDetectionsUpdated = { newDetections ->
-                    detections = newDetections
-                }
-            )
+            CameraPreview()
         } else {
             Column(
                 modifier = Modifier
@@ -134,10 +142,7 @@ fun CameraScreen(modifier: Modifier = Modifier) {
 }
 
 @Composable
-fun CameraPreview(
-    detections: List<Detection>,
-    onDetectionsUpdated: (List<Detection>) -> Unit
-) {
+fun CameraPreview() {
     val lifecycleOwner = LocalLifecycleOwner.current
     val context = LocalContext.current
 
@@ -146,6 +151,11 @@ fun CameraPreview(
 
     // OkHttp Client
     val client = remember { OkHttpClient() }
+
+    // Variables to hold image dimensions
+    var imageWidth by remember { mutableIntStateOf(1) }
+    var imageHeight by remember { mutableIntStateOf(1) }
+    var detections by remember { mutableStateOf<List<Detection>>(emptyList()) }
 
     DisposableEffect(Unit) {
         val executor = ContextCompat.getMainExecutor(context)
@@ -162,11 +172,16 @@ fun CameraPreview(
 
                 var lastAnalyzedTime = 0L
 
+                // Inside the analyzer
                 imageAnalyzer.setAnalyzer(executor) { imageProxy ->
                     val currentTime = System.currentTimeMillis()
-                    if (currentTime - lastAnalyzedTime >= 200L) { // Process 5 frames per-second
+                    if (currentTime - lastAnalyzedTime >= MainActivity.DETECTION_INTERVAL) {
                         lastAnalyzedTime = currentTime
-                        processImageProxy(imageProxy, onDetectionsUpdated, client, context)
+                        processImageProxy(imageProxy, { newDetections, imgWidth, imgHeight ->
+                            detections = newDetections
+                            imageWidth = imgWidth
+                            imageHeight = imgHeight
+                        }, client)
                     } else {
                         imageProxy.close()
                     }
@@ -210,50 +225,65 @@ fun CameraPreview(
         Canvas(modifier = Modifier.fillMaxSize()) {
             if (detections.isNotEmpty()) {
                 detections.forEach { detection ->
-                    val color = if (detection.label == "Critical Defect") Color.Red else if (detection.label == "Minor Defect") Color.Yellow else if (detection.label == "No Defect") Color.Green else Color.Magenta
-                    val strokeWidth = 4f
+                    // Choose the appropriate color based on the label
+                    val boxColor = when (detection.label) {
+                        "Critical Defect" -> Color.Red
+                        "Major Defect" -> Color.Red
+                        "Minor Defect" -> Color.Yellow
+                        else -> Color.Green
+                    }
+                    val boxStrokeWidth = 4f
 
-                    // Convert detection coordinates to canvas coordinates
+                    // Use the image dimensions for scaling
+                    val scaleX = size.width / imageWidth.toFloat()
+                    val scaleY = size.height / imageHeight.toFloat()
 
-                    val scaleX = size.width / 640f // Adjust as needed
-                    val scaleY = size.height / 480f // Adjust as needed
+                    //val rectLeft = (detection.x - detection.width / 2f) * scaleX
+                    val rectLeft = (detection.x - detection.width / 1.3f) * scaleX
+                    val rectTop = (detection.y - detection.height / 2f) * scaleY
+                    //val rectWidth = detection.width * scaleX
+                    val rectWidth = detection.width * scaleX * 1.5f
+                    val rectHeight = detection.height * scaleY
 
-                    val oldLeft = detection.x * scaleX - (detection.width * scaleX) / 2
-                    val oldTop = detection.y * scaleY - (detection.height * scaleY) / 2
-                    val oldWidth = detection.width * scaleX
-                    val oldHeight = detection.height * scaleY
-
-                    val rectHeight = oldWidth * size.height/size.width
-                    val rectLeft = size.width - (oldTop * size.width / size.height + oldHeight * size.width/size.height)
-                    val rectTop = oldLeft * size.height / size.width + oldWidth * size.height/size.width - rectHeight
-                    val rectWidth = oldHeight * size.width/size.height
-
-
-                    // test code
-/*
-                    val scaleX = size.width / 640f
-                    val scaleY = size.height / 480f
-
-                    val rectLeft = size.height - (detection.y * scaleY +detection.height * scaleY)
-                    val rectTop = size.width - (detection.x * scaleX + detection.width * scaleX)
-                    val rectWidth = detection.height * scaleY
-                    val rectHeight = detection.width * scaleX
-*/
-                    //test
-                    /*
-                    val rectLeft = 0.0.toFloat()
-                    val rectTop = 0.0.toFloat()
-                    val rectWidth = size.width/2
-                    val rectHeight = size.height
-                     */
-
-
+                    // Draw detection rectangle
                     drawRect(
-                        color = color,
+                        color = boxColor,
                         topLeft = Offset(rectLeft, rectTop),
                         size = Size(rectWidth, rectHeight),
-                        style = Stroke(width = strokeWidth)
+                        style = Stroke(width = boxStrokeWidth)
                     )
+
+                    // Draw text label
+                    drawContext.canvas.nativeCanvas.apply {
+                        drawText(
+                            "${detection.label} (${String.format("%.2f", detection.confidence)})",
+                            rectLeft,
+                            rectTop - 10f, // Position above box
+                            Paint().apply {
+                                color = android.graphics.Color.WHITE
+                                textSize = 40f
+                                strokeWidth = 10f
+                                style = android.graphics.Paint.Style.STROKE
+                                strokeJoin = android.graphics.Paint.Join.ROUND
+                            }
+                        )
+                        drawText(
+                            "${detection.label} (${String.format("%.2f", detection.confidence)})",
+                            rectLeft,
+                            rectTop - 10f,
+                            Paint().apply {
+                                color = if (detection.label == "Critical Defect") 
+                                    android.graphics.Color.RED 
+                                else if (detection.label == "Major Defect")
+                                    android.graphics.Color.RED
+                                else if (detection.label == "Minor Defect")
+                                    android.graphics.Color.YELLOW
+                                else
+                                    android.graphics.Color.GREEN
+                                textSize = 40f
+                            }
+                        )
+                    }
                 }
             } else {
                 // Draw a green border if no detections are present
@@ -270,6 +300,8 @@ fun CameraPreview(
 
 // Helper function to convert ImageProxy to Bitmap
 fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
+    val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+
     val yBuffer = imageProxy.planes[0].buffer
     val uBuffer = imageProxy.planes[1].buffer
     val vBuffer = imageProxy.planes[2].buffer
@@ -285,20 +317,34 @@ fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
 
     val yuvImage = YuvImage(nv21, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
     val out = ByteArrayOutputStream()
-    yuvImage.compressToJpeg(Rect(0, 0, imageProxy.width, imageProxy.height), 80, out)
+    yuvImage.compressToJpeg(Rect(0, 0, yuvImage.width, yuvImage.height), 80, out)
     val imageBytes = out.toByteArray()
-    return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+    var bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+
+    // Rotate the bitmap according to the rotationDegrees
+    bitmap = rotateBitmap(bitmap, rotationDegrees.toFloat())
+
+    return bitmap
+}
+
+// Helper function to rotate a bitmap
+fun rotateBitmap(bitmap: Bitmap, rotationDegrees: Float): Bitmap {
+    val matrix = Matrix()
+    matrix.postRotate(rotationDegrees)
+    return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
 }
 
 // Process ImageProxy: Convert to Bitmap, encode to Base64, and send to API
 fun processImageProxy(
     imageProxy: ImageProxy,
-    onDetectionsUpdated: (List<Detection>) -> Unit,
-    client: OkHttpClient,
-    context: Context
+    onDetectionsUpdated: (List<Detection>, Int, Int) -> Unit,
+    client: OkHttpClient
 ) {
     val bitmap = imageProxyToBitmap(imageProxy)
     imageProxy.close() // Close the image to prevent memory leaks
+
+    val imageWidth = bitmap.width
+    val imageHeight = bitmap.height
 
     // Convert bitmap to Base64 without line breaks
     val outputStream = ByteArrayOutputStream()
@@ -307,7 +353,9 @@ fun processImageProxy(
     val base64Image = Base64.encodeToString(byteArray, Base64.NO_WRAP)
 
     // Send the image to the API
-    sendImageToApi(base64Image, onDetectionsUpdated, client)
+    sendImageToApi(base64Image, { detections ->
+        onDetectionsUpdated(detections, imageWidth, imageHeight)
+    }, client)
 }
 
 // Updated sendImageToApi function
@@ -377,8 +425,9 @@ fun processApiResponse(
             val width = prediction.getDouble("width").toFloat()
             val height = prediction.getDouble("height").toFloat()
             val label = prediction.getString("class")
+            val confidence = prediction.getDouble("confidence").toFloat()
 
-            detectionList.add(Detection(x, y, width, height, label))
+            detectionList.add(Detection(x, y, width, height, label, confidence))
         }
 
         onDetectionsUpdated(detectionList)
